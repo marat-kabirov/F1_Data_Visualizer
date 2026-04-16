@@ -22,6 +22,7 @@ class Telemetry(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     race_id = Column(Integer, ForeignKey("races.id"))
+    driver_number = Column(Integer)
     speed = Column(Integer)
     rpm = Column(Integer)
     gear = Column(Integer)

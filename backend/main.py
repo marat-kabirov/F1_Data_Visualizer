@@ -1,29 +1,34 @@
-from urllib import response
-
+import os
 import requests
-from fastapi import FastAPI, Depends, HTTPException
+import numpy as np
+from fastapi import FastAPI, Body, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from groq import Groq
+from dotenv import load_dotenv
 
-# Импортируем наши новые модули
+# Загружаем ключ из .env
+load_dotenv()
+
 from app.database import SessionLocal, engine, Base
 from app.models import Race, Telemetry
 from app.schemas import RaceInfo
 
-# Создаем таблицы в БД (если их еще нет)
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="F1 Analytics Engine")
 
+# Инициализация клиента Groq
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"], # Адрес твоего Vite
+    allow_origins=["http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Функция (Dependency) для получения сессии БД
 def get_db():
     db = SessionLocal()
     try:
@@ -33,84 +38,83 @@ def get_db():
 
 @app.on_event("startup")
 def sync_data():
-    """Синхронизация данных из API в PostgreSQL при старте"""
+    """Синхронизация при старте"""
     db = SessionLocal()
-    print("--- Проверка актуальности данных в БД ---")
-    
     url = "https://api.openf1.org/v1/sessions?session_name=Race"
-    response = requests.get(url)
-    
-    if response.status_code == 200:
-        data = response.json()
-        for item in data:
-            # Проверяем, есть ли уже такая гонка в базе (по дате и стране)
-            exists = db.query(Race).filter(Race.date_start == item['date_start']).first()
-            if not exists:
-                new_race = Race(
-                country=item['country_name'],
-                location=item['location'],
-                circuit=item['circuit_short_name'],
-                year=item['year'],
-                date_start=item['date_start'],
-                session_key=item['session_key'] # ВАЖНО: сохраняем ключ сессии
-            )
-                db.add(new_race)
-        db.commit()
-        print(f"--- Синхронизация завершена. Данные в безопасности в Postgres ---")
-    db.close()
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            for item in data:
+                exists = db.query(Race).filter(Race.date_start == item['date_start']).first()
+                if not exists:
+                    new_race = Race(
+                        country=item['country_name'],
+                        location=item['location'],
+                        circuit=item['circuit_short_name'],
+                        year=item['year'],
+                        date_start=item['date_start'],
+                        session_key=item['session_key']
+                    )
+                    db.add(new_race)
+            db.commit()
+    except Exception as e:
+        print(f"Sync error: {e}")
+    finally:
+        db.close()
 
 @app.get("/races")
 def get_all_races(db: Session = Depends(get_db)):
-    """Возвращает список всех гонок из базы данных"""
-    races = db.query(Race).all()
-    return races
+    return db.query(Race).all()
 
-@app.get("/search", response_model=RaceInfo)
-def search_race(country: str, db: Session = Depends(get_db)):
-    # ТЕПЕРЬ МЫ ИЩЕМ В ПОСТГРЕСЕ, А НЕ В ИНТЕРНЕТЕ
-    race = db.query(Race).filter(Race.country.ilike(country)).first()
+@app.post("/analyze-telemetry")
+async def analyze_telemetry(data: list = Body(...)):
+    """Вызов реальной LLM Groq для анализа"""
+    s1 = [d['speed1'] for d in data if d['speed1'] is not None]
+    s2 = [d['speed2'] for d in data if d['speed2'] is not None]
     
-    if not race:
-        raise HTTPException(status_code=404, detail="Race not found in database")
-    
-    # Возвращаем данные из БД, а Pydantic сам превратит их в JSON
-    return race
+    if not s1 or not s2:
+        return {"analysis": "Insufficient data points for AI inference."}
 
-@app.post("/sync-telemetry/{session_key}")
-def sync_telemetry(session_key: int):
+    avg1, max1 = np.mean(s1), np.max(s1)
+    avg2, max2 = np.mean(s2), np.max(s2)
+
+    prompt = f"""
+    Analyze F1 telemetry:
+    Driver A: Avg {avg1:.1f} km/h, Top {max1} km/h.
+    Driver B: Avg {avg2:.1f} km/h, Top {max2} km/h.
+    Provide a professional PhD-level race engineering verdict (max 2 sentences).
+    Focus on cornering efficiency and power delivery.
+    """
+
+    try:
+        completion = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return {"analysis": completion.choices[0].message.content}
+    except Exception as e:
+        return {"analysis": f"AI Engine Error: {str(e)}"}
+
+@app.post("/sync-telemetry/{session_key}/{driver_number}")
+def sync_telemetry(session_key: int, driver_number: int):
     db = SessionLocal()
     try:
-        # 1. Сначала найдем гонку в нашей базе, чтобы знать её race.id
         race = db.query(Race).filter(Race.session_key == session_key).first()
-        if not race:
-            return {"status": "error", "message": "Race not found in local DB"}
+        if not race: return {"status": "error", "message": "Race not found"}
 
-        # 2. Формируем URL для запроса к внешнему API
-        url = f"https://api.openf1.org/v1/car_data?session_key={session_key}&driver_number=1"
-        
-        print(f"--- Запрос к API: {url} ---")
-        response = requests.get(url, timeout=10)
+        url = f"https://api.openf1.org/v1/car_data?session_key={session_key}&driver_number={driver_number}"
+        response = requests.get(url, timeout=15)
         data = response.json()
 
-        if not data:
-            return {"status": "empty"}
+        if not data: return {"status": "empty"}
 
-        # --- ТВОЙ ФИЛЬТР ACTIVE DATA ---
-        active_data = [entry for entry in data if int(entry.get('speed', 0)) > 10]
-
-        if not active_data:
-            print("Машина стояла всю сессию, берем последние 300...")
-            subset = data[-300:]
-        else:
-            # Берем 300 точек из середины гонки (где самый экшн)
-            mid = len(active_data) // 2
-            start = max(0, mid - 150)
-            subset = active_data[start : start + 300]
-        # --------------------------
-
+        # Ограничиваем срез для стабильности
+        subset = data[-300:] 
         for entry in subset:
             new_point = Telemetry(
-                race_id=race.id, # Теперь race определен!
+                race_id=race.id,
+                driver_number=driver_number,
                 speed=int(entry.get('speed', 0)),
                 rpm=int(entry.get('rpm', 0)),
                 gear=int(entry.get('gear', 0)),
@@ -118,35 +122,28 @@ def sync_telemetry(session_key: int):
                 date=str(entry.get('date'))
             )
             db.add(new_point)
-        
         db.commit()
-        print(f"--- COMMIT SUCCESS! Добавлено {len(subset)} точек ---")
-        return {"status": "success", "msg": f"Added {len(subset)} active records"}
-    
+        return {"status": "success", "added": len(subset)}
     except Exception as e:
         db.rollback()
-        print(f"Ошибка: {e}")
         return {"status": "error", "message": str(e)}
     finally:
         db.close()
-        
-@app.get("/test-db")
-def test_db(db: Session = Depends(get_db)):
-    # Считаем, сколько записей в каждой таблице
-    races_count = db.query(Race).count()
-    telemetry_count = db.query(Telemetry).count()
-    return {
-        "races_in_db": races_count,
-        "telemetry_points_in_db": telemetry_count
-    }
 
-@app.get("/telemetry/{session_key}")
-def get_telemetry(session_key: int, db: Session = Depends(get_db)):
-    # Находим гонку по ключу сессии
+@app.get("/telemetry/{session_key}/{driver_number}")
+def get_telemetry(session_key: int, driver_number: int, db: Session = Depends(get_db)):
     race = db.query(Race).filter(Race.session_key == session_key).first()
-    if not race:
-        raise HTTPException(status_code=404, detail="Race not found")
+    if not race: raise HTTPException(status_code=404, detail="Race not found")
     
-    # Забираем всю телеметрию для этой гонки
-    telemetry_data = db.query(Telemetry).filter(Telemetry.race_id == race.id).order_by(Telemetry.date.asc()).all()
-    return telemetry_data
+    return db.query(Telemetry).filter(
+        Telemetry.race_id == race.id,
+        Telemetry.driver_number == driver_number
+    ).order_by(Telemetry.date.asc()).all()
+
+@app.get("/drivers/{session_key}")
+def get_drivers(session_key: int):
+    url = f"https://api.openf1.org/v1/drivers?session_key={session_key}"
+    res = requests.get(url, timeout=10)
+    if res.status_code == 200:
+        return [{"number": d['driver_number'], "name": d['full_name'], "code": d['name_acronym']} for d in res.json()]
+    return []
