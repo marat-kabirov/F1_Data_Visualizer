@@ -1,0 +1,36 @@
+services:
+  db:
+    image: postgres:15
+    restart: always
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=marikayrik04
+      - POSTGRES_DB=f1_db
+    ports:
+      - "5432:5432"
+    # Проверка: готова ли база принимать подключения
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d f1_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - DATABASE_URL=postgresql://postgres:marikayrik04@db:5432/f1_db
+    depends_on:
+      db:
+        condition: service_healthy # Ждем, пока healthcheck базы станет успешным
+    restart: always
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+    restart: always
