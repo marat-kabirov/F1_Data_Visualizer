@@ -97,22 +97,37 @@ async def analyze_telemetry(data: list = Body(...)):
         return {"analysis": f"AI Engine Error: {str(e)}"}
 
 @app.post("/sync-telemetry/{session_key}/{driver_number}")
-def sync_telemetry(session_key: int, driver_number: int):
-    db = SessionLocal()
+def sync_telemetry(session_key: int, driver_number: int, db: Session = Depends(get_db)):
     try:
+        # 1. Проверяем наличие гонки
         race = db.query(Race).filter(Race.session_key == session_key).first()
-        if not race: return {"status": "error", "message": "Race not found"}
+        if not race: 
+            return {"status": "error", "message": "Race not found"}
 
+        # 2. Очищаем старые данные (Идемпотентность)
+        # Чтобы при повторном нажатии не плодить дубликаты
+        db.query(Telemetry).filter(
+            Telemetry.race_id == race.id, 
+            Telemetry.driver_number == driver_number
+        ).delete()
+
+        # 3. Запрос к OpenF1
         url = f"https://api.openf1.org/v1/car_data?session_key={session_key}&driver_number={driver_number}"
         response = requests.get(url, timeout=15)
+        
+        if response.status_code != 200:
+            return {"status": "error", "message": f"OpenF1 API error: {response.status_code}"}
+            
         data = response.json()
+        if not data: 
+            return {"status": "empty", "message": "No data found for this driver"}
 
-        if not data: return {"status": "empty"}
-
-        # Ограничиваем срез для стабильности
-        subset = data[-300:] 
-        for entry in subset:
-            new_point = Telemetry(
+        # 4. Обработка данных
+        # Берем последние 1000 точек для более глубокого анализа
+        subset = data[-1000:] 
+        
+        telemetry_objects = [
+            Telemetry(
                 race_id=race.id,
                 driver_number=driver_number,
                 speed=int(entry.get('speed', 0)),
@@ -120,16 +135,25 @@ def sync_telemetry(session_key: int, driver_number: int):
                 gear=int(entry.get('gear', 0)),
                 throttle=int(entry.get('throttle', 0)),
                 date=str(entry.get('date'))
-            )
-            db.add(new_point)
+            ) for entry in subset
+        ]
+
+        # Используем bulk_save_objects для ускорения записи в БД
+        db.bulk_save_objects(telemetry_objects)
         db.commit()
-        return {"status": "success", "added": len(subset)}
+
+        return {
+            "status": "success", 
+            "added": len(telemetry_objects), 
+            "driver": driver_number,
+            "session": session_key
+        }
+
     except Exception as e:
         db.rollback()
+        print(f"Telemetry Sync Error: {e}")
         return {"status": "error", "message": str(e)}
-    finally:
-        db.close()
-
+    
 @app.get("/telemetry/{session_key}/{driver_number}")
 def get_telemetry(session_key: int, driver_number: int, db: Session = Depends(get_db)):
     race = db.query(Race).filter(Race.session_key == session_key).first()
