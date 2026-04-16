@@ -1,3 +1,5 @@
+from urllib import response
+
 import requests
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -76,59 +78,58 @@ def search_race(country: str, db: Session = Depends(get_db)):
 
 @app.post("/sync-telemetry/{session_key}")
 def sync_telemetry(session_key: int):
-    from app.database import SessionLocal
-    import traceback # Чтобы видеть полную ошибку
-    
     db = SessionLocal()
     try:
+        # 1. Сначала найдем гонку в нашей базе, чтобы знать её race.id
         race = db.query(Race).filter(Race.session_key == session_key).first()
         if not race:
-            return {"error": f"Race {session_key} not found"}
+            return {"status": "error", "message": "Race not found in local DB"}
 
+        # 2. Формируем URL для запроса к внешнему API
         url = f"https://api.openf1.org/v1/car_data?session_key={session_key}&driver_number=1"
+        
         print(f"--- Запрос к API: {url} ---")
-        
         response = requests.get(url, timeout=10)
-        
-        if response.status_code != 200:
-            print(f"!!! API Error: {response.status_code} !!!")
-            return {"error": f"API returned {response.status_code}"}
-            
         data = response.json()
-        print(f"--- Получено записей: {len(data)} ---")
 
         if not data:
             return {"status": "empty"}
 
-        # Пробуем сохранить только 5 штук и смотрим на каждую
-        for i in range(min(5, len(data))):
-            entry = data[i]
-            print(f"Пробую записать точку {i}: {entry.get('date')}")
-            
+        # --- ТВОЙ ФИЛЬТР ACTIVE DATA ---
+        active_data = [entry for entry in data if int(entry.get('speed', 0)) > 10]
+
+        if not active_data:
+            print("Машина стояла всю сессию, берем последние 300...")
+            subset = data[-300:]
+        else:
+            # Берем 300 точек из середины гонки (где самый экшн)
+            mid = len(active_data) // 2
+            start = max(0, mid - 150)
+            subset = active_data[start : start + 300]
+        # --------------------------
+
+        for entry in subset:
             new_point = Telemetry(
-                race_id=race.id,
-                speed=int(entry.get('speed', 0)), # Принудительно в int
+                race_id=race.id, # Теперь race определен!
+                speed=int(entry.get('speed', 0)),
                 rpm=int(entry.get('rpm', 0)),
                 gear=int(entry.get('gear', 0)),
                 throttle=int(entry.get('throttle', 0)),
-                date=str(entry.get('date')) # Принудительно в str
+                date=str(entry.get('date'))
             )
             db.add(new_point)
         
-        print("--- Пробую сделать COMMIT ---")
         db.commit()
-        print("--- COMMIT SUCCESS! ---")
-        
-        return {"status": "success", "msg": "Records added"}
-
+        print(f"--- COMMIT SUCCESS! Добавлено {len(subset)} точек ---")
+        return {"status": "success", "msg": f"Added {len(subset)} active records"}
+    
     except Exception as e:
         db.rollback()
-        error_details = traceback.format_exc() # ПОЛНЫЙ ТРЕЙСБЭК
-        print(f"!!!!!!!! КРИТИЧЕСКАЯ ОШИБКА !!!!!!!!\n{error_details}")
-        return {"status": "error", "exception": str(e), "trace": error_details}
+        print(f"Ошибка: {e}")
+        return {"status": "error", "message": str(e)}
     finally:
         db.close()
-
+        
 @app.get("/test-db")
 def test_db(db: Session = Depends(get_db)):
     # Считаем, сколько записей в каждой таблице
@@ -138,3 +139,14 @@ def test_db(db: Session = Depends(get_db)):
         "races_in_db": races_count,
         "telemetry_points_in_db": telemetry_count
     }
+
+@app.get("/telemetry/{session_key}")
+def get_telemetry(session_key: int, db: Session = Depends(get_db)):
+    # Находим гонку по ключу сессии
+    race = db.query(Race).filter(Race.session_key == session_key).first()
+    if not race:
+        raise HTTPException(status_code=404, detail="Race not found")
+    
+    # Забираем всю телеметрию для этой гонки
+    telemetry_data = db.query(Telemetry).filter(Telemetry.race_id == race.id).order_by(Telemetry.date.asc()).all()
+    return telemetry_data
